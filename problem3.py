@@ -3,16 +3,21 @@ from ellipsoidgeometry import *
 from guccionematerial import *
 from lvproblem import *
 from contsolver import *
-import os
+from postprocess import *
+from fenicshotools.vtkutils import *
 
-parameters["form_compiler"]["representation"] = "uflacs"
-parameters["allow_extrapolation"] = True
+import os
 
 class Problem3(object) :
     def __init__(self, comm, postprocess=True, **params) :
         # parameters
         p = self.default_parameters()
         p.update(params)
+
+        # global parameters
+        parameters["form_compiler"]["representation"] = "uflacs"
+        parameters["allow_extrapolation"] = True
+        parameters['form_compiler']['quadrature_degree'] = p['quad']
 
         # filename
         gtype = "axisym" if p['axisymmetric'] else "full3d"
@@ -25,7 +30,6 @@ class Problem3(object) :
         MPI.barrier(comm)
 
         # quadrature order for all forms
-        parameters['form_compiler']['quadrature_degree'] = p['quad']
         fspace = 'Quadrature_{:d}'.format(p['quad'])
 
         # geometry
@@ -55,11 +59,6 @@ class Problem3(object) :
         self.comm  = comm
         self.postprocess = postprocess
 
-        # load solution
-        if postprocess :
-            with HDF5File(self.comm, self.fname, 'r') as f :
-                f.read(self.problem.state, '/solution')
-
     @staticmethod
     def default_parameters() :
         p = { 'axisymmetric' : True,
@@ -70,14 +69,42 @@ class Problem3(object) :
         return p
 
     def run(self) :
+        pb = self.problem
+        # load solution
         if self.postprocess :
-            raise RuntimeError
+            with HDF5File(self.comm, self.fname, 'r') as f :
+                f.read(pb.state, '/solution')
+        else :
+            # solve
+            solver = ContinuationSolver(self.problem, symmetric=True,
+                                        backend='mumps')
+            solver.solve(pendo=15.0, Tactive=60.0, step=0.25)
 
-        # solve
-        solver = ContinuationSolver(self.problem)
-        solver.solve(pendo=15.0, Tactive=60.0, step=0.25)
+            # save full solution
+            with HDF5File(self.comm, self.fname, 'a') as f :
+                f.write(self.problem.state, '/solution')
 
-        # save full solution
-        with HDF5File(self.comm, self.fname, 'a') as f :
-            f.write(self.problem.state, '/solution')
+        # postprocess if in serial
+        if MPI.size(self.comm) == 1 :
+            vname = os.path.splitext(self.fname)[0] + ".vtu"
+            domain, u, E, J = compute_postprocessed_quantities(pb, ndiv=0)
+            grid = dolfin2vtk(domain, u.function_space())
+            vtk_add_field(grid, E)
+            vtk_add_field(grid, J)
+            vtk_add_field(grid, u)
+            vtk_write_file(grid, vname)
+
+if __name__ == "__main__" :
+    comm = mpi_comm_world()
+    if MPI.rank(comm) == 0 :
+        set_log_level(PROGRESS)
+    else :
+        set_log_level(ERROR)
+
+    post = False
+    pb = Problem3(comm, post, ndiv=16, order=2, quad=4, axisymmetric=True)
+    pb.run()
+
+    info("vol = {}".format(pb.problem.get_Vendo()))
+    info("dof = {}".format(pb.problem.state.function_space().dim()))
 

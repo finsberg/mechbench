@@ -25,7 +25,7 @@ class Problem1(object) :
                 '_p{order}_q{quad}.h5'\
                 .format(gtype=gtype, **p)
         if not os.path.isfile(fname) and postprocess :
-            raise RuntimeError
+            postprocess = False
         if os.path.isfile(fname) and not postprocess and MPI.rank(comm) == 0 :
             os.remove(fname)
         MPI.barrier(comm)
@@ -75,10 +75,10 @@ class Problem1(object) :
         # postprocess if in serial
         if MPI.size(self.comm) == 1 :
             vname = os.path.splitext(self.fname)[0] + ".vtu"
-            E = compute_strain(pb)
-            u = Function(pb.state.sub(0, deepcopy=True), name="displacement")
-            grid = dolfin2vtk(pb.geo.domain, u.function_space())
+            domain, u, E, J = compute_postprocessed_quantities(pb, ndiv=0)
+            grid = dolfin2vtk(domain, u.function_space())
             vtk_add_field(grid, E)
+            vtk_add_field(grid, J)
             vtk_add_field(grid, u)
             vtk_write_file(grid, vname)
 
@@ -90,8 +90,8 @@ if __name__ == "__main__" :
         set_log_level(ERROR)
 
     post = False
-    pb = Problem1(comm, post, ndiv=2, order=2, quad=8,
-                  reduction_factor=32.0, structured=False)
+    pb = Problem1(comm, post, ndiv=2, order=3, quad=4,
+                  reduction_factor=16.0, structured=False)
     pb.run()
 
     info("pos = {}".format(pb.problem.get_point_position()))

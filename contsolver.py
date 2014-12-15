@@ -116,7 +116,7 @@ class ContinuationSolver(object) :
             # save old solution
             uold = pb.state.copy(True)
             told = tt
-            pold = pp
+            pold = pp.copy()
 
             # tentative step
             pp += dt*pdir
@@ -131,8 +131,9 @@ class ContinuationSolver(object) :
             except RuntimeError :
                 info("CONVERGENCE FAILURE, reducing time-step")
                 tt = told
-                pp = pold
+                pp[:] = pold
                 pb.state.assign(uold)
+                pb.set_control_parameters(**dict(zip(pnames, pp)))
                 dt *= 0.5
                 continue
 

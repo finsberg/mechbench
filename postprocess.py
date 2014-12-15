@@ -1,18 +1,84 @@
 from fenics import *
 from fenicshotools.linearizedomain import *
 from fenicshotools.vtkutils import *
+import numpy as np
 
-__all__ = [ "compute_strain" ]
+__all__ = [ "compute_postprocessed_quantities" ]
 
-def compute_strain(problem, ndiv=0) :
-    # first we linearize the domain
-    #ucoarse = problem.state.sub(0, deepcopy=True)
-    domain = problem.geo.domain
-    #mesh, u = linearize_domain_and_fields(domain, ucoarse, ndiv=ndiv)
-    #domain = mesh.ufl_domain()
-    u = split(problem.state)[0]
+def __extract_displacement_with_domain(problem, isoparam=True) :
+    # we reconstruct the function space to keep track of
+    # the domain (bug in DOLFIN 1.5)
+    # extract the displacement
+    if problem.mat.is_incompressible() :
+        uold = problem.state.sub(0)
+        Vold = problem.state.function_space().sub(0)
+    else :
+        uold = problem.state
+        Vold = problem.state.function_space()
+    # it might be that the domain is linear but the field is not.
+    # In this case we construct isoparametric element when requested
+    elm = Vold.ufl_element()
+    family, degree, shape = elm.family(), elm.degree(), elm.value_shape()[0]
+    D = problem.geo.domain
+    if isoparam and not D.coordinates() :
+        mesh = D.data()
+        gdim = D.geometric_dimension()
+        Vlin = VectorFunctionSpace(mesh, family, degree, shape)
+        e = Expression(tuple("x[{}]".format(i) for i in range(gdim)),
+                       element=Vlin.ufl_element())
+        coords = Function(Vlin)
+        coords.interpolate(e)
+        D = Domain(coords)
 
-    # compute the strain
+    V = VectorFunctionSpace(D, family, degree, shape)
+    u = Function(V)
+    assign(u, uold)
+
+    return u, D
+
+def __axisymmetric_to_cartesian_displacement(ufun, domain) :
+    V = ufun.function_space()
+    idxV = np.column_stack([ V.sub(i).dofmap().dofs()
+                for i in xrange(0, V.num_sub_spaces()) ])
+    if idxV.shape[1] == 2 :
+        uX, uR = np.hsplit(ufun.vector().array()[idxV], 2)
+        uT = np.zeros(shape=uX.shape)
+    else :
+        uX, uR, uT = np.hsplit(ufun.vector().array()[idxV], 3)
+
+    # extract dof coordinates
+    if domain.coordinates() :
+        phi = domain.coordinates()
+        VD = phi.function_space()
+        idxD = np.column_stack([ VD.sub(i).dofmap().dofs()
+                    for i in xrange(0, VD.num_sub_spaces()) ])
+        X, R = np.hsplit(phi.vector().array()[idxD], 2)
+    else :
+        coords = V.dofmap().tabulate_all_coordinates(V.mesh()).reshape((-1,2))
+        X, R = np.hsplit(coords[idxV[:,0]], 2)
+    T = np.zeros(shape=X.shape)
+
+    # displacement in cartesian coordinates
+    x, r, t = X + uX, R + uR, T + uT
+    Y, Z = R * np.cos(T), R * np.sin(T)
+    y, z = r * np.cos(t), r * np.sin(t)
+    uY, uZ = y - Y, z - Z
+
+    ufun.vector()[idxV[:,0]] = uX.flatten().astype(np.float)
+    ufun.vector()[idxV[:,1]] = uY.flatten().astype(np.float)
+    if idxV.shape[1] == 3 :
+        ufun.vector()[idxV[:,2]] = uZ.flatten().astype(np.float)
+
+def compute_postprocessed_quantities(problem, ndiv=-1) :
+    # extract the displacement
+    u, domain = __extract_displacement_with_domain(problem)
+    # linearize the domain if requested
+    if ndiv >= 0 :
+        mesh, u = linearize_domain_and_fields(domain, u, ndiv=ndiv)
+        domain = mesh.ufl_domain()
+    u.rename("displacement", "displacement")
+
+    # compute the strain and the cartesian displacement
     I = Identity(3)
     gradu = grad(u)
 
@@ -44,7 +110,8 @@ def compute_strain(problem, ndiv=0) :
         F = I + gradu
         Jgeo = 1.0
 
-    Jm23 = pow(det(F), -float(2)/3)
+    J = det(F)
+    Jm23 = pow(J, -float(2)/3)
     C = Jm23 * F.T*F
     E = 0.5*(C - I)
 
@@ -55,69 +122,16 @@ def compute_strain(problem, ndiv=0) :
     lsolver = LocalSolver()
     lsolver.solve(Eout.vector(), a, L)
 
-    return Eout
-
-def compute_errorL2() :
-    # load most refined solution
-    pbref = Problem2(comm, True, order=2, ndiv=32, quad=4)
-    pbref.run()
-    uref = pbref.problem.state.sub(0, deepcopy=True)
-    errL2 = []
-    ndivs = [ 1, 2, 4, 8 ]
-    for ndiv in ndivs :
-        pb = Problem2(comm, False, order=2, ndiv=ndiv, quad=6)
-        pb.run()
-        u = pb.problem.state.sub(0, deepcopy=True)
-        # interpolate on the refined mesh
-        V = VectorFunctionSpace(pbref.problem.geo.domain, 'P', 2)
-        uint = Function(V)
-        I = LagrangeInterpolator()
-        I.interpolate(uint, u)
-        uuref = split(pbref.problem.state)[0]
-        errL2.append(sqrt(assemble(inner(uuref-uint,uuref-uint)*pbref.problem.Jgeo*dx)))
-
-    print np.array(errL2)
-    import matplotlib.pyplot as plt
-    hh = 1./np.array(ndivs)
-    plt.loglog(hh, errL2, linewidth=2)
-    plt.loglog(hh[0:2], hh[0:2]**2, 'k')
-    plt.loglog(hh[0:2], hh[0:2], 'k--')
-    plt.grid(True)
-    plt.show()
-
-def compute_axisymmetric_to_cartesian_displacement(problem) :
-    # displacement reordered by components
-    ufun = Function(problem.state.sub(0, deepcopy=True), name="displacement")
-    if not problem.geo._parameters['axisymmetric'] :
-        return ufun
-
-    V = ufun.function_space()
-    idxV = np.column_stack([ V.sub(i).dofmap().dofs()
-                for i in xrange(0, V.num_sub_spaces()) ])
-    uX, uR, uT = np.hsplit(ufun.vector().array()[idxV], 3)
-
-    # extract dof coordinates
-    domain = problem.geo.domain
-    if domain.coordinates() :
-        phi = domain.coordinates()
-        VD = phi.function_space()
-        idxD = np.column_stack([ VD.sub(i).dofmap().dofs()
-                    for i in xrange(0, VD.num_sub_spaces()) ])
-        X, R = np.hsplit(phi.vector().array()[idxD], 2)
-    else :
-        coords = V.dofmap().tabulate_all_coordinates(V.mesh()).reshape((-1,2))
-        X, R = np.hsplit(coords[idxV[:,0]], 2)
-    T = np.zeros(shape=X.shape)
+    V = FunctionSpace(domain, 'DG', 0)
+    a = Form(inner(TestFunction(V), TrialFunction(V))*Jgeo*dx)
+    L = Form(inner(TestFunction(V), J)*Jgeo*dx)
+    Jout = Function(V, name='jacobian')
+    lsolver = LocalSolver()
+    lsolver.solve(Jout.vector(), a, L)
 
     # displacement in cartesian coordinates
-    x, r, t = X + uX, R + uR, T + uT
-    Y, Z = R * np.cos(T), R * np.sin(T)
-    y, z = r * np.cos(t), r * np.sin(t)
-    uY, uZ = y - Y, z - Z
-
-    ufun.vector()[idxV[:,0]] = uX.flatten().astype(np.float)
-    ufun.vector()[idxV[:,1]] = uY.flatten().astype(np.float)
-    ufun.vector()[idxV[:,2]] = uZ.flatten().astype(np.float)
-
-    return ufun
+    if problem.geo.is_axisymmetric() :
+        __axisymmetric_to_cartesian_displacement(u, domain)
+    
+    return domain, u, Eout, Jout
 
