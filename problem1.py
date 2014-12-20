@@ -90,8 +90,8 @@ if __name__ == "__main__" :
         set_log_level(ERROR)
 
     post = False
-    pb = Problem1(comm, post, ndiv=2, order=3, quad=4,
-                  reduction_factor=16.0, structured=False)
+    pb = Problem1(comm, post, ndiv=1, order=2, quad=6,
+                  reduction_factor=1.0, structured=False)
     pb.run()
 
     info("pos = {}".format(pb.problem.get_point_position()))

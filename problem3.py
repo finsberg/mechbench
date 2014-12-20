@@ -102,7 +102,7 @@ if __name__ == "__main__" :
         set_log_level(ERROR)
 
     post = False
-    pb = Problem3(comm, post, ndiv=16, order=2, quad=4, axisymmetric=True)
+    pb = Problem3(comm, post, ndiv=1, order=2, quad=4, axisymmetric=True)
     pb.run()
 
     info("vol = {}".format(pb.problem.get_Vendo()))

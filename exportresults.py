@@ -1,21 +1,28 @@
+from tvtk.api import tvtk
+from tvtk.array_handler import *
+from tvtk.api import write_data
 from vtk import *
+import numpy as np
 import h5py
 import os, errno
+
+from pprint import pprint
 
 def __mkdir_p(path):
     try:
         os.makedirs(path)
-    except OSError as exc: # Python >2.5
+    except OSError as exc:
         if exc.errno == errno.EEXIST and os.path.isdir(path):
             pass
         else: raise
 
-def __export_bench_format(basedir, basename, transform) :
+def __export_bench_bar(basedir, basename) :
     h5name = '{}.h5'.format(basename)
     vtname = '{}.vtu'.format(basename)
 
     with h5py.File(h5name, 'r') as f :
         dof = f['solution/vector_0'].shape[0]
+    print("DOF = {}".format(dof))
 
     reader = vtkXMLUnstructuredGridReader()
     reader.SetFileName(vtname)
@@ -24,64 +31,125 @@ def __export_bench_format(basedir, basename, transform) :
     grid = reader.GetOutput()
     grid.GetCellData().RemoveArray("jacobian")
 
+    # reflection
+    refl = vtkReflectionFilter()
+    refl.SetPlaneToYMax()
+    refl.SetInputData(grid)
+    refl.Update()
+
     # warped geometry
-    grid.GetPointData().SetActiveVectors('displacement')
+    refl.GetOutput().GetPointData().SetActiveVectors('displacement')
     warp = vtkWarpVector()
-    warp.SetInputData(grid)
+    warp.SetInputConnection(refl.GetOutputPort())
     warp.Update()
 
     warp.GetOutput().GetPointData().RemoveArray('displacement')
-    grid.GetPointData().RemoveArray('displacement')
-
-    if transform == 'axisym' :
-        # rotate to have z as major axis
-        trans = vtkTransform()
-        trans.RotateY(90)
-        tfilter1 = vtkTransformFilter()
-        tfilter1.SetTransform(trans)
-        tfilter1.SetInputData(grid)
-        tfilter1.Update()
-        # rotational extrusion
-        geom = vtkGeometryFilter()
-        geom.SetInputConnection(tfilter1.GetOutputPort())
-        extr = vtkRotationalExtrusionFilter()
-        extr.SetResolution(6)
-        extr.SetAngle(90)
-        extr.SetInputConnection(geom.GetOutputPort())
-        extr.Update()
-        ogrid = extr.GetOutput()
-        writer = vtkPolyDataWriter()
-        writer.SetInputData(extr.GetOutput())
-        writer.SetFileName('{}/{}/deformed.vtk'.format(basedir, dof))
-        writer.Write()
-        #print "aaa"
-        exit(0)
-        trans = vtkTransform()
-        trans.RotateY(90)
-        tfilter1 = vtkTransformFilter()
-        tfilter1.SetTransform(trans)
-        tfilter1.SetInputData(grid)
-        tfilter1.Update()
-        ogrid = tfilter1.GetOutput()
-        tfilter2 = vtkTransformFilter()
-        tfilter2.SetTransform(trans)
-        tfilter2.SetInputConnection(warp.GetOutputPort())
-        tfilter2.Update()
-        owarp = tfilter2
-    elif transform == 'sym' :
-        ogrid = grid
-        owarp = warp
+    refl.GetOutput().GetPointData().RemoveArray('displacement')
 
     # writer
     __mkdir_p('{}/{}'.format(basedir, dof))
     writer = vtkUnstructuredGridWriter()
-    writer.SetInputConnection(owarp.GetOutputPort())
+    writer.SetInputConnection(warp.GetOutputPort())
     writer.SetFileName('{}/{}/deformed.vtk'.format(basedir, dof))
     writer.Write()
 
-    writer.SetInputData(ogrid)
+    writer.SetInputConnection(refl.GetOutputPort())
     writer.SetFileName('{}/{}/undeformed.vtk'.format(basedir, dof))
     writer.Write()
+
+def __export_bench_axisym(basedir, basename, nslices=64) :
+    h5name = '{}.h5'.format(basename)
+    vtname = '{}.vtu'.format(basename)
+
+    with h5py.File(h5name, 'r') as f :
+        dof = f['solution/vector_0'].shape[0]
+    print("DOF = {}".format(dof))
+
+    # read the axisymmetric solution
+    reader = tvtk.XMLUnstructuredGridReader(file_name=vtname)
+    reader.update()
+    grid = reader.get_output()
+    X = grid.points.to_array()
+    elm = grid.get_cells().to_array().reshape((-1,4))[:,1:].astype(np.intc)
+
+    # fields
+    E = grid.cell_data.get_array('strain').to_array()
+    u = grid.point_data.get_array('displacement').to_array()
+    Exx, Exy, Exz = E[:,0], E[:,1], E[:,2]
+    Eyy, Eyz, Ezz = E[:,4], E[:,5], E[:,8]
+
+    # deformed pts
+    x = X + u
+
+    # rotational extrusion
+    # Xnew = Ry(pi/2) Rx(pi/2) Rx(theta)
+    # NOTE: we don't care about degenerate wedges
+    Xnew = [np.column_stack([X[:,1], -X[:,2], -X[:,0]])]
+    xnew = [np.column_stack([x[:,1], -x[:,2], -x[:,0]])]
+    elmnew = []
+    Exxnew, Exynew, Exznew = [], [], []
+    Eyynew, Eyznew, Ezznew = [], [], []
+    for i in xrange(1, nslices) :
+        theta = 2.0*i/nslices * np.pi
+        off1 = (i-1)*len(X)
+        off2 = i*len(X)
+        X1rot = +X[:,1]*np.cos(theta) - X[:,2]*np.sin(theta)
+        X2rot = -X[:,1]*np.sin(theta) - X[:,2]*np.cos(theta)
+        X3rot = -X[:,0]
+        x1rot = +x[:,1]*np.cos(theta) - x[:,2]*np.sin(theta)
+        x2rot = -x[:,1]*np.sin(theta) - x[:,2]*np.cos(theta)
+        x3rot = -x[:,0]
+        # new points
+        Xnew += [np.column_stack([X1rot, X2rot, X3rot])]
+        xnew += [np.column_stack([x1rot, x2rot, x3rot])]
+        elmnew += [np.column_stack([elm + off1, elm + off2])]
+        # strain (evaluated in the middle point)
+        tmid = 2.0*i/nslices * np.pi + 1.0/nslices * np.pi
+        Exxnew += [Ezz*np.sin(tmid)**2 + Eyy*(1-np.sin(tmid)**2)]
+        Exynew += [-0.5*np.sin(2*tmid)*(Eyy-Ezz)]
+        Exznew += [-Exy*np.cos(tmid)]
+        Eyynew += [Eyy*np.sin(tmid)**2 + Ezz*(1-np.sin(tmid)**2)]
+        Eyznew += [Exy*np.sin(tmid)]
+        Ezznew += [Exx]
+
+    # final slice
+    tmid = 1.0/nslices * np.pi
+    elmnew += [np.column_stack([elm + off2, elm])]
+    Exxnew += [Ezz*np.sin(tmid)**2 + Eyy*(1-np.sin(tmid)**2)]
+    Exynew += [-0.5*np.sin(2*tmid)*(Eyy-Ezz)]
+    Exznew += [-Exy*np.cos(tmid)]
+    Eyynew += [Eyy*np.sin(tmid)**2 + Ezz*(1-np.sin(tmid)**2)]
+    Eyznew += [Exy*np.sin(tmid)]
+    Ezznew += [Exx]
+
+    # to numpy array
+    Xnew = np.vstack(Xnew)
+    xnew = np.vstack(xnew)
+    elmnew = np.vstack(elmnew)
+    Exxnew = np.hstack(Exxnew)
+    Exynew = np.hstack(Exynew)
+    Exznew = np.hstack(Exznew)
+    Eyynew = np.hstack(Eyynew)
+    Eyznew = np.hstack(Eyznew)
+    Ezznew = np.hstack(Ezznew)
+    Enew = np.vstack([Exxnew, Exynew, Exznew,
+                      Exynew, Eyynew, Eyznew,
+                      Exznew, Eyznew, Ezznew]).transpose()
+
+    ug = tvtk.UnstructuredGrid(points=Xnew)
+    ug.set_cells(tvtk.Wedge().cell_type, elmnew.astype('f'))
+    ug.cell_data.tensors = Enew
+    ug.cell_data.tensors.name = 'E'
+
+    ugdef = tvtk.UnstructuredGrid(points=xnew)
+    ugdef.set_cells(tvtk.Wedge().cell_type, elmnew.astype('f'))
+    ugdef.cell_data.tensors = Enew
+    ugdef.cell_data.tensors.name = 'E'
+
+    # writer
+    __mkdir_p('{}/{}'.format(basedir, dof))
+    write_data(ug, '{}/{}/undeformed.vtk'.format(basedir, dof))
+    write_data(ugdef, '{}/{}/deformed.vtk'.format(basedir, dof))
 
 if __name__ == "__main__" :
     try :
@@ -90,26 +158,26 @@ if __name__ == "__main__" :
         pass
 
     # problem 1
-    #basedir = './results_out/problem 1'
-    #__mkdir_p(basedir)
-    #for ndiv in [ 1, 2, 4, 8, 16 ] :
-    #    print("EXPORT PROBLEM 1 -- NDIV = {}".format(ndiv))
-    #    basename = 'results/P1_unstruct_r01.0_n{:03d}_p2_q4'.format(ndiv)
-    #    __export_bench_format(basedir, basename, transform='sym')
+    basedir = './results_out/problem 1'
+    __mkdir_p(basedir)
+    for ndiv in [ 1, 2, 4, 8 ] :
+        print("EXPORT PROBLEM 1 -- NDIV = {}".format(ndiv))
+        basename = 'results/P1_unstruct_r01.0_n{:03d}_p2_q4'.format(ndiv)
+        __export_bench_bar(basedir, basename)
 
     # problem 2
-    #basedir = './results_out/problem 2'
-    #__mkdir_p(basedir)
-    #for ndiv in [ 1, 2, 4, 8, 16, 32, 64 ] :
-    #    print("EXPORT PROBLEM 2 -- NDIV = {}".format(ndiv))
-    #    basename = 'results/P2_axisym_n{:03d}_p2_q6'.format(ndiv)
-    #    __export_bench_format(basedir, basename, transform='axisym')
+    basedir = './results_out/problem 2'
+    __mkdir_p(basedir)
+    for ndiv in [ 1, 2, 4, 8 ] :
+        print("EXPORT PROBLEM 2 -- NDIV = {}".format(ndiv))
+        basename = 'results/P2_axisym_n{:03d}_p2_q6'.format(ndiv)
+        __export_bench_axisym(basedir, basename)
 
     # problem 3
     basedir = './results_out/problem 3'
     __mkdir_p(basedir)
-    for ndiv in [ 1 ]: #, 2, 4, 8, 16, 32, 64 ] :
+    for ndiv in [ 1, 2, 4, 8 ] :
         print("EXPORT PROBLEM 3 -- NDIV = {}".format(ndiv))
         basename = 'results/P3_axisym_n{:03d}_p2_q6'.format(ndiv)
-        __export_bench_format(basedir, basename, transform='axisym')
+        __export_bench_axisym(basedir, basename)
 
