@@ -85,7 +85,7 @@ class BarGeometry(object) :
                   'force_generation' : False,
                   'structured' : False,
                   'reduction_factor' : 16.0,
-                  'nx' : 10, 'ny' : 1, 'nz' : 1,
+                  'nx' : 4, 'ny' : 1, 'nz' : 1,
                   'psize' : 1.0,
                   'ndiv' : 1 } }
         return p

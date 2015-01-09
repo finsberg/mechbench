@@ -36,7 +36,7 @@ Numerical methods (FE, basis type, incompressibility type) :
 
 - Computational time (on 4 cores): 2sec for the smaller simulation,
   10min for the largest one.
- 
+
 Summary of the results (* = vtk with strain available):
 
 order  ndiv   fact     dofs    posx    posy    posz

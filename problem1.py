@@ -21,8 +21,8 @@ class Problem1(object) :
 
         # filename
         gtype = ("" if p['structured'] else "un") + "struct"
-        fname = '{outdir}/P1_{gtype}_r{reduction_factor:04.1f}_n{ndiv:03d}'\
-                '_p{order}_q{quad}.h5'\
+        fname = '{outdir}/pb1/{gtype}_n{ndiv:03d}_p{order}'\
+                '_r{reduction_factor:04.1f}_q{quad}.h5'\
                 .format(gtype=gtype, **p)
         if not os.path.isfile(fname) and postprocess :
             postprocess = False
@@ -75,10 +75,9 @@ class Problem1(object) :
         # postprocess if in serial
         if MPI.size(self.comm) == 1 :
             vname = os.path.splitext(self.fname)[0] + ".vtu"
-            domain, u, E, J = compute_postprocessed_quantities(pb, ndiv=0)
+            domain, u, E = compute_postprocessed_quantities(pb)
             grid = dolfin2vtk(domain, u.function_space())
             vtk_add_field(grid, E)
-            vtk_add_field(grid, J)
             vtk_add_field(grid, u)
             vtk_write_file(grid, vname)
 
@@ -91,7 +90,7 @@ if __name__ == "__main__" :
 
     post = False
     pb = Problem1(comm, post, ndiv=1, order=2, quad=6,
-                  reduction_factor=1.0, structured=False)
+                  reduction_factor=16.0, structured=True)
     pb.run()
 
     info("pos = {}".format(pb.problem.get_point_position()))

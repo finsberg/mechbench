@@ -64,10 +64,10 @@ def __axisymmetric_to_cartesian_displacement(ufun, domain) :
     y, z = r * np.cos(t), r * np.sin(t)
     uY, uZ = y - Y, z - Z
 
-    ufun.vector()[idxV[:,0]] = uX.flatten().astype(np.float)
-    ufun.vector()[idxV[:,1]] = uY.flatten().astype(np.float)
+    ufun.vector()[idxV[:,0].copy()] = uX.flatten().astype(np.float)
+    ufun.vector()[idxV[:,1].copy()] = uY.flatten().astype(np.float)
     if idxV.shape[1] == 3 :
-        ufun.vector()[idxV[:,2]] = uZ.flatten().astype(np.float)
+        ufun.vector()[idxV[:,2].copy()] = uZ.flatten().astype(np.float)
 
 def compute_postprocessed_quantities(problem, ndiv=-1) :
     # extract the displacement
@@ -115,23 +115,26 @@ def compute_postprocessed_quantities(problem, ndiv=-1) :
     C = Jm23 * F.T*F
     E = 0.5*(C - I)
 
-    V = TensorFunctionSpace(domain, 'DG', 0, shape=(3,3))
-    a = Form(inner(TestFunction(V), TrialFunction(V))*Jgeo*dx)
-    L = Form(inner(TestFunction(V), E)*Jgeo*dx)
-    Eout = Function(V, name='strain')
-    lsolver = LocalSolver()
-    lsolver.solve(Eout.vector(), a, L)
-
-    V = FunctionSpace(domain, 'DG', 0)
-    a = Form(inner(TestFunction(V), TrialFunction(V))*Jgeo*dx)
-    L = Form(inner(TestFunction(V), J)*Jgeo*dx)
-    Jout = Function(V, name='jacobian')
-    lsolver = LocalSolver()
-    lsolver.solve(Jout.vector(), a, L)
+    if ndiv >=0 :
+        V = TensorFunctionSpace(domain, 'DG', 0, shape=(3,3))
+        a = Form(inner(TestFunction(V), TrialFunction(V))*Jgeo*dx)
+        L = Form(inner(TestFunction(V), E)*Jgeo*dx)
+        Eout = Function(V, name='strain')
+        lsolver = LocalSolver()
+        lsolver.solve(Eout.vector(), a, L)
+    else :
+        # in this case we keep the high-order domain unchanged
+        # and we perform a global L2 projection to recover a
+        # continuous strain
+        V = TensorFunctionSpace(domain, 'CG', 2, shape=(3,3))
+        a = inner(TestFunction(V), TrialFunction(V))*Jgeo*dx
+        L = inner(TestFunction(V), E)*Jgeo*dx
+        Eout = Function(V, name='strain')
+        solve(a == L, Eout, solver_parameters={"linear_solver":"mumps"})
 
     # displacement in cartesian coordinates
     if problem.geo.is_axisymmetric() :
         __axisymmetric_to_cartesian_displacement(u, domain)
     
-    return domain, u, Eout, Jout
+    return domain, u, Eout
 

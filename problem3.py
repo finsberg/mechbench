@@ -8,8 +8,8 @@ from fenicshotools.vtkutils import *
 
 import os
 
-class Problem3(object) :
-    def __init__(self, comm, postprocess=True, **params) :
+class Problem3(object):
+    def __init__(self, comm, postprocess=True, **params):
         # parameters
         p = self.default_parameters()
         p.update(params)
@@ -21,11 +21,11 @@ class Problem3(object) :
 
         # filename
         gtype = "axisym" if p['axisymmetric'] else "full3d"
-        fname = '{outdir}/P3_{gtype}_n{ndiv:03d}_p{order}_q{quad}.h5'\
+        fname = '{outdir}/pb3/{gtype}_n{ndiv:03d}_p{order}_q{quad}.h5'\
                 .format(gtype=gtype, **p)
-        if not os.path.isfile(fname) and postprocess :
+        if not os.path.isfile(fname) and postprocess:
             raise RuntimeError
-        if os.path.isfile(fname) and not postprocess and MPI.rank(comm) == 0 :
+        if os.path.isfile(fname) and not postprocess and MPI.rank(comm) == 0:
             os.remove(fname)
         MPI.barrier(comm)
 
@@ -60,7 +60,7 @@ class Problem3(object) :
         self.postprocess = postprocess
 
     @staticmethod
-    def default_parameters() :
+    def default_parameters():
         p = { 'axisymmetric' : True,
               'ndiv' : 1,
               'order' : 1,
@@ -68,41 +68,40 @@ class Problem3(object) :
               'outdir' : './results' }
         return p
 
-    def run(self) :
+    def run(self):
         pb = self.problem
         # load solution
-        if self.postprocess :
-            with HDF5File(self.comm, self.fname, 'r') as f :
+        if self.postprocess:
+            with HDF5File(self.comm, self.fname, 'r') as f:
                 f.read(pb.state, '/solution')
-        else :
+        else:
             # solve
             solver = ContinuationSolver(self.problem, symmetric=True,
                                         backend='mumps')
             solver.solve(pendo=15.0, Tactive=60.0, step=0.25)
 
             # save full solution
-            with HDF5File(self.comm, self.fname, 'a') as f :
+            with HDF5File(self.comm, self.fname, 'a') as f:
                 f.write(self.problem.state, '/solution')
 
         # postprocess if in serial
-        if MPI.size(self.comm) == 1 :
+        if MPI.size(self.comm) == 1:
             vname = os.path.splitext(self.fname)[0] + ".vtu"
-            domain, u, E, J = compute_postprocessed_quantities(pb, ndiv=0)
+            domain, u, E = compute_postprocessed_quantities(pb)
             grid = dolfin2vtk(domain, u.function_space())
             vtk_add_field(grid, E)
-            vtk_add_field(grid, J)
             vtk_add_field(grid, u)
             vtk_write_file(grid, vname)
 
-if __name__ == "__main__" :
+if __name__ == "__main__":
     comm = mpi_comm_world()
-    if MPI.rank(comm) == 0 :
+    if MPI.rank(comm) == 0:
         set_log_level(PROGRESS)
     else :
         set_log_level(ERROR)
 
     post = False
-    pb = Problem3(comm, post, ndiv=1, order=2, quad=4, axisymmetric=True)
+    pb = Problem3(comm, post, ndiv=1, order=2, quad=6, axisymmetric=True)
     pb.run()
 
     info("vol = {}".format(pb.problem.get_Vendo()))
