@@ -1,14 +1,15 @@
-from fenics import *
-from fenicshotools.gmsh import geo2dolfin
-from fenicshotools.geometry import *
-
+import cardiac_geometries as cg
+import math
+from dolfin import *
+from ufl_legacy import cofac
 from textwrap import dedent
 import os.path
 import itertools
 
-__all__ = [ 'EllipsoidGeometry' ]
+__all__ = ["EllipsoidGeometry"]
 
-class EllipsoidGeometry(object) :
+
+class EllipsoidGeometry(object):
     """
     Truncated ellipsoidal geometry, defined through the coordinates:
 
@@ -19,7 +20,7 @@ class EllipsoidGeometry(object) :
     for t in [0, 1], mu in [0, mu_base] and theta in [0, 2pi).
     """
 
-    def __init__(self, comm=None, h5name='', h5group='', **params) :
+    def __init__(self, comm=None, h5name="", h5group="", **params):
         """
         Keyword arguments:
         comm    -- MPI communicator (if None, MPI_COMM_WORLD is used)
@@ -28,153 +29,182 @@ class EllipsoidGeometry(object) :
         params  -- Geometry parameters (see default_parameters())
         """
 
-        # mpi communicator
-        comm = comm or mpi_comm_world()
+        quota_base = 5.0
+        r_long_endo = 17
+        r_long_epi = 20
+        mu_base_endo = math.acos(quota_base / r_long_endo)
+        mu_base_epi = math.acos(quota_base / r_long_epi)
+        mu_apex_endo = mu_apex_epi = 0
+        geo = cg.create_lv_ellipsoid(
+            "data/lv_ellipsoid",
+            create_fibers=True,
+            fiber_space="Quadrature_4",
+            r_short_endo=7,
+            r_short_epi=10,
+            r_long_endo=r_long_endo,
+            r_long_epi=r_long_epi,
+            fiber_angle_endo=90,
+            fiber_angle_epi=-90,
+        )
+        for k, v in geo.__dict__.items():
+            setattr(self, k, v)
 
-        # set up parameters
-        params = params or {}
-        self._parameters = self.default_parameters()
-        self._parameters.update(params)
+        for k, v in geo.markers.items():
+            setattr(self, k, v[0])
+        self.bfun = self.ffun
+        self.domain = self.mesh
 
-        # try to load the mesh
-        regen = True
-        if not self._parameters['mesh_generation']['force_generation'] :
-            if os.path.isfile(h5name) :
-                # load the geometry
-                info('Load geometry from file')
-                domain, markers = load_geometry(comm, h5name, h5group)
-                # load the parameters
-                p = { k: v for k, v in self._parameters.items() 
-                         if not isinstance(v, dict) }
-                with HDF5File(comm, h5name, 'a') as f :
-                    ggroup = '{}/geometry'.format(h5group)
-                    for k, v in p.items() :
-                        self._parameters[k] = f.attributes(ggroup)[k]
-                regen = False
+        # # mpi communicator
+        # comm = comm or mpi_comm_world()
 
-        # regenerate the mesh if necessary
-        dim = 2 if self.is_axisymmetric() else 3
-        if regen :
-            info('Generate geometry')
-            code = self._compile_geo_code()
-            domain, markers = geo2dolfin(code, dim, dim, comm)
+        # # set up parameters
+        # params = params or {}
+        # self._parameters = self.default_parameters()
+        # self._parameters.update(params)
 
-        # save the mesh
-        if regen and h5name != '' :
-            info('Save geometry to file')
-            save_geometry(comm, domain, h5name, h5group, markers)
-            # save parameters
-            p = { k: v for k, v in self._parameters.items() 
-                       if not isinstance(v, dict) }
-            with HDF5File(comm, h5name, 'a') as f :
-                ggroup = '{}/geometry'.format(h5group)
-                for k, v in p.items() :
-                    f.attributes(ggroup)[k] = v
+        # # try to load the mesh
+        # regen = True
+        # if not self._parameters["mesh_generation"]["force_generation"]:
+        #     if os.path.isfile(h5name):
+        #         # load the geometry
+        #         info("Load geometry from file")
+        #         domain, markers = load_geometry(comm, h5name, h5group)
+        #         # load the parameters
+        #         p = {
+        #             k: v for k, v in self._parameters.items() if not isinstance(v, dict)
+        #         }
+        #         with HDF5File(comm, h5name, "a") as f:
+        #             ggroup = "{}/geometry".format(h5group)
+        #             for k, v in p.items():
+        #                 self._parameters[k] = f.attributes(ggroup)[k]
+        #         regen = False
 
-        # markers
-        mesh = domain.data()
-        bfun = MeshFunction("size_t", mesh, dim-1, mesh.domains())
-        for marker, (name, _) in markers.items() :
-            setattr(self, name, marker)
+        # # regenerate the mesh if necessary
+        # dim = 2 if self.is_axisymmetric() else 3
+        # if regen:
+        #     info("Generate geometry")
+        #     code = self._compile_geo_code()
+        #     domain, markers = geo2dolfin(code, dim, dim, comm)
 
-        # microstructure
-        mspace = self._parameters['microstructure']['function_space']
-        if mspace != '' :
-            info('Creating microstructure')
-            # coordinate mapping
-            coordscode = self._compile_cart2coords_code()
-            coords = Expression(cppcode=coordscode)
-            if domain.coordinates()  :
-                coords.coords = domain.coordinates()
-            # local coordinate base
-            localbasecode = self._compile_localbase_code()
-            localbase = Expression(cppcode=localbasecode)
-            localbase.cart2coords = coords
-            # function space
-            family, degree = mspace.split("_")
-            degree = int(degree)
-            V = TensorFunctionSpace(domain, family, degree, shape=(3,3))
-            # microstructure expression
-            microcode = self._compile_microstructure_code()
-            micro = Expression(cppcode=microcode)
-            micro.cart2coords = coords
-            micro.localbase = localbase
-            micro.alpha_endo = self._parameters['microstructure']['alpha_endo']
-            micro.alpha_epi = self._parameters['microstructure']['alpha_epi']
-            # interpolation
-            microinterp = interpolate(micro, V)
-            self.s0 = microinterp[0, :]
-            self.n0 = microinterp[1, :]
-            self.f0 = microinterp[2, :]
-        else :
-            # microstructure not necessary
-            self.f0 = None
-            self.s0 = None
-            self.n0 = None
+        # # save the mesh
+        # if regen and h5name != "":
+        #     info("Save geometry to file")
+        #     save_geometry(comm, domain, h5name, h5group, markers)
+        #     # save parameters
+        #     p = {k: v for k, v in self._parameters.items() if not isinstance(v, dict)}
+        #     with HDF5File(comm, h5name, "a") as f:
+        #         ggroup = "{}/geometry".format(h5group)
+        #         for k, v in p.items():
+        #             f.attributes(ggroup)[k] = v
 
-        # exposing data
-        self.domain = domain
-        self.bfun = bfun
+        # # markers
+        # mesh = domain.data()
+        # bfun = MeshFunction("size_t", mesh, dim - 1, mesh.domains())
+        # for marker, (name, _) in markers.items():
+        #     setattr(self, name, marker)
+
+        # # microstructure
+        # mspace = self._parameters["microstructure"]["function_space"]
+        # if mspace != "":
+        #     info("Creating microstructure")
+        #     # coordinate mapping
+        #     coordscode = self._compile_cart2coords_code()
+        #     coords = Expression(cppcode=coordscode)
+        #     if domain.coordinates():
+        #         coords.coords = domain.coordinates()
+        #     # local coordinate base
+        #     localbasecode = self._compile_localbase_code()
+        #     localbase = Expression(cppcode=localbasecode)
+        #     localbase.cart2coords = coords
+        #     # function space
+        #     family, degree = mspace.split("_")
+        #     degree = int(degree)
+        #     V = TensorFunctionSpace(domain, family, degree, shape=(3, 3))
+        #     # microstructure expression
+        #     microcode = self._compile_microstructure_code()
+        #     micro = Expression(cppcode=microcode)
+        #     micro.cart2coords = coords
+        #     micro.localbase = localbase
+        #     micro.alpha_endo = self._parameters["microstructure"]["alpha_endo"]
+        #     micro.alpha_epi = self._parameters["microstructure"]["alpha_epi"]
+        #     # interpolation
+        #     microinterp = interpolate(micro, V)
+        #     self.s0 = microinterp[0, :]
+        #     self.n0 = microinterp[1, :]
+        #     self.f0 = microinterp[2, :]
+        # else:
+        #     # microstructure not necessary
+        #     self.f0 = None
+        #     self.s0 = None
+        #     self.n0 = None
+
+        # # exposing data
+        # self.domain = domain
+        # self.bfun = bfun
 
     @staticmethod
-    def default_parameters() :
-        p = { 'axisymmetric' : False,
-              'mesh_generation' : {
-                  'force_generation' : False,
-                  'order' : 1,
-                  'psize' : 3.0,
-                  'ndiv'  : 1 },
-              'microstructure' : {
-                  'function_space' : 'Quadrature_4',
-                  'alpha_endo' : +90.0,
-                  'alpha_epi'  : -90.0 },
-              'r_short_endo' : 7.0,
-              'r_short_epi'  : 10.0,
-              'r_long_endo'  : 17.0,
-              'r_long_epi'   : 20.0,
-              'quota_base'   : -5.0 }
+    def default_parameters():
+        p = {
+            "axisymmetric": False,
+            "mesh_generation": {
+                "force_generation": False,
+                "order": 1,
+                "psize": 3.0,
+                "ndiv": 1,
+            },
+            "microstructure": {
+                "function_space": "Quadrature_4",
+                "alpha_endo": +90.0,
+                "alpha_epi": -90.0,
+            },
+            "r_short_endo": 7.0,
+            "r_short_epi": 10.0,
+            "r_long_endo": 17.0,
+            "r_long_epi": 20.0,
+            "quota_base": -5.0,
+        }
         return p
 
-    def is_axisymmetric(self) :
+    def is_axisymmetric(self):
         """
         Check if the mesh is axisymmetric.
         """
-        return self._parameters['axisymmetric']
+        return False
 
-    def get_apex_position(self, surf, u=None) :
+    def get_apex_position(self, surf, u=None):
         """
         Return the apex position.
         Keyword arguments:
         surf -- surface, can be 'endocardium' or 'epicardium'
         u    -- displacement field
         """
-        mesh = self.domain.data()
-        sid = { 'endocardium': self.ENDOPT, 'epicardium': self.EPIPT}[surf]
-        marker = { k: v for v, k in mesh.domains().markers(0).items() }
+        mesh = self.mesh
+        sid = {"endocardium": self.ENDOPT, "epicardium": self.EPIPT}[surf]
+        marker = {k: v for v, k in mesh.domains().markers(0).items()}
         comm = mesh.mpi_comm()
-        if sid in marker :
+        if sid in marker:
             idx = marker[sid]
             X = mesh.coordinates()[idx, :]
-            if u :
+            if u:
                 pos = X[0] + u(X)[0]
-            else :
+            else:
                 pos = X[0]
-        else :
+        else:
             pos = 0.0
 
         return MPI.sum(comm, pos)
 
-    def inner_volume_form(self, u = None) :
+    def inner_volume_form(self, u=None):
         dom = self.domain
-        quota = self._parameters['quota_base']
+        quota = -5
         X = SpatialCoordinate(dom)
         N = FacetNormal(dom)
 
-        if self.is_axisymmetric() :
+        if self.is_axisymmetric():
             xshift = Constant((quota, 0.0))
 
             X = X - xshift
-            N = as_vector([ N[0], N[1], 0.0 ])
+            N = as_vector([N[0], N[1], 0.0])
 
             u = u or Constant((0.0, 0.0, 0.0), cell=dom)
 
@@ -183,26 +213,24 @@ class EllipsoidGeometry(object) :
             z, r = Z + u[0], R + u[1]
             zZ, zR = z.dx(0), z.dx(1)
             rZ, rR = r.dx(0), r.dx(1)
-            if u.ufl_shape[0] == 2 :
-                t = 0.0;
+            if u.ufl_shape[0] == 2:
+                t = 0.0
                 tZ, tR = 0.0, 0.0
-            else :
+            else:
                 t = u[2]
                 tZ, tR = t.dx(0), t.dx(1)
 
             # jacobian of the map
-            Jgeo = 2.0*DOLFIN_PI*R
+            Jgeo = 2.0 * DOLFIN_PI * R
             # deformation gradient tensor
-            F = as_tensor([[ zZ, zR, 0.0 ],
-                           [ rZ, rR, 0.0 ],
-                           [ tZ, tR, 1.0 ]])
+            F = as_tensor([[zZ, zR, 0.0], [rZ, rR, 0.0], [tZ, tR, 1.0]])
             # normalization of components
-            F = diag(as_vector([ 1, 1, r ])) * F
-            F = F * diag(as_vector([ 1, 1, 1/R ]))
+            F = diag(as_vector([1, 1, r])) * F
+            F = F * diag(as_vector([1, 1, 1 / R]))
 
             x = as_vector([z, r, t])
-            n = cofac(F)*as_vector([N[0], N[1], 0.0])
-        else :
+            n = cofac(F) * as_vector([N[0], N[1], 0.0])
+        else:
             xshift = Constant((quota, 0.0, 0.0))
 
             u = u or Constant((0.0, 0.0, 0.0))
@@ -213,25 +241,25 @@ class EllipsoidGeometry(object) :
 
             Jgeo = 1.0
 
-        return -1.0/3.0 * Jgeo * inner(x, n)
+        return -1.0 / 3.0 * Jgeo * inner(x, n)
 
-    def inner_volume(self, u = None) :
+    def inner_volume(self, u=None):
         """
         Compute the inner volume.
         """
-        ds_endo = ds(self.ENDO, subdomain_data = self.bfun)
+        ds_endo = ds(self.ENDO, subdomain_data=self.bfun)
         Vendo_form = self.inner_volume_form(u) * ds_endo
         V = assemble(Vendo_form)
 
         return V
 
-    def _compile_geo_code(self) :
+    def _compile_geo_code(self):
         """
         Geo code for the geometry.
         """
 
-        code = dedent(\
-        """\
+        code = dedent(
+            """\
         r_short_endo = {r_short_endo};
         r_short_epi  = {r_short_epi};
         r_long_endo  = {r_long_endo};
@@ -325,13 +353,14 @@ class EllipsoidGeometry(object) :
 
         Physical Point("ENDOPT") = {{ apex_endo }};
         Physical Point("EPIPT") = {{ apex_epi }};
-        """).format(**self._parameters)
+        """
+        ).format(**self._parameters)
 
         return code
 
-    def _compile_cart2coords_code(self) :
-        code = dedent(\
-        """\
+    def _compile_cart2coords_code(self):
+        code = dedent(
+            """\
         #include <boost/math/tools/roots.hpp>
 
         namespace dolfin
@@ -416,13 +445,14 @@ class EllipsoidGeometry(object) :
         }};
 
         }};
-        """).format(**self._parameters)
+        """
+        ).format(**self._parameters)
 
         return code
 
-    def _compile_localbase_code(self) :
-        code = dedent(\
-        """\
+    def _compile_localbase_code(self):
+        code = dedent(
+            """\
         #include <Eigen/Dense>
 
         namespace dolfin
@@ -498,16 +528,17 @@ class EllipsoidGeometry(object) :
         }};
 
         }};
-        """).format(**self._parameters)
+        """
+        ).format(**self._parameters)
 
         return code
 
-    def _compile_microstructure_code(self) :
+    def _compile_microstructure_code(self):
         """
         C++ code for analytic fiber and sheet.
         """
-        code = dedent(\
-        """\
+        code = dedent(
+            """\
         #include <Eigen/Dense>
 
         class EllipsoidMicrostructure : public Expression
@@ -563,45 +594,46 @@ class EllipsoidGeometry(object) :
                 Eigen::Map<mat_type>(values.data()) = S;
             }}
         }};
-        """).format()
+        """
+        ).format()
 
         return code
 
-if __name__ == '__main__' :
+
+if __name__ == "__main__":
     # test on different geometries
     parameters["form_compiler"]["representation"] = "uflacs"
     parameters["form_compiler"]["quadrature_degree"] = 4
 
     comm = mpi_comm_world()
-    if MPI.rank(comm) != 0 :
+    if MPI.rank(comm) != 0:
         set_log_level(WARNING)
 
     axisym = True
-    if axisym :
-        ndivs  = [ 1, 2, 4, 8, 16, 32, 64 ]
-        orders = [ 1, 2, 3 ]
-    else :
-        ndivs  = [ 1, 2, 4 ]
-        orders = [ 1, 2 ]
+    if axisym:
+        ndivs = [1, 2, 4, 8, 16, 32, 64]
+        orders = [1, 2, 3]
+    else:
+        ndivs = [1, 2, 4]
+        orders = [1, 2]
 
-    for ndiv, order in itertools.product(ndivs, orders) :
+    for ndiv, order in itertools.product(ndivs, orders):
         info("===================")
         info("n = {}, order = {}".format(ndiv, order))
         info("===================")
         geoparam = EllipsoidGeometry.default_parameters()
-        geoparam['axisymmetric'] = axisym
-        geoparam['mesh_generation']['force_generation'] = True
-        geoparam['mesh_generation']['order'] = order
-        geoparam['mesh_generation']['ndiv'] = ndiv
-        geoparam['microstructure']['function_space'] = ''
-        geo = EllipsoidGeometry(comm, '', **geoparam)
+        geoparam["axisymmetric"] = axisym
+        geoparam["mesh_generation"]["force_generation"] = True
+        geoparam["mesh_generation"]["order"] = order
+        geoparam["mesh_generation"]["ndiv"] = ndiv
+        geoparam["microstructure"]["function_space"] = ""
+        geo = EllipsoidGeometry(comm, "", **geoparam)
 
-        volume   = geo.inner_volume()
-        apexendo = geo.get_apex_position('endocardium')
-        apexepi  = geo.get_apex_position('epicardium')
+        volume = geo.inner_volume()
+        apexendo = geo.get_apex_position("endocardium")
+        apexepi = geo.get_apex_position("epicardium")
 
         info("Volume    = {:.2f} mm3".format(volume))
         info("apex endo = {:.2f} mm".format(apexendo))
         info("apex epi  = {:.2f} mm".format(apexepi))
         info("")
-
